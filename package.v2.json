@@ -1,0 +1,15 @@
+{
+  "FollowUp": {
+    "name": "续作跟进",
+    "description": "根据媒体库、订阅历史和可选 CookieCloud Trakt 日历检查续作并自动订阅",
+    "labels": "订阅, 自动化",
+    "version": "1.6.3",
+    "icon": "https://raw.githubusercontent.com/i-kirito/MoviePilot-FollowUp/main/icons/followup.png",
+    "author": "i-kirito",
+    "level": 2,
+    "history": {
+      "1.6.3": "i-kirito 维护版：重做详情页概览、状态卡片和记录表格，保留 Trakt 日历与失败重试链路。",
+      "1.6.2": "增加 CookieCloud Trakt 个人剧集日历、明确 TMDB ID 匹配与事件状态记录。"
+    }
+  }
+}
