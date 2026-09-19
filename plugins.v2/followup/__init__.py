@@ -124,7 +124,7 @@ class FollowUp(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/i-kirito/MoviePilot-FollowUp/main/icons/followup.png"
     # 插件版本
-    plugin_version = "1.6.3"
+    plugin_version = "1.6.4"
     # 插件作者
     plugin_author = "i-kirito"
     # 作者主页
@@ -870,6 +870,9 @@ class FollowUp(_PluginBase):
         # 自动订阅成功后，插件自身的临时数据会被清理；历史记录保存在
         # SubscribeHistory 中，因此详情页必须从历史表读取，而不是只看 get_data()。
         history_records = self.get_followup_subscription_history(limit=60)
+        # 详情页只承担运行概览和最近记录预览，避免把整张卡片撑成长列表。
+        # 完整历史仍保留在 SubscribeHistory 中，数量徽标用于提示总量。
+        preview_limit = 5
         try:
             active_records = [
                 item
@@ -1032,7 +1035,7 @@ class FollowUp(_PluginBase):
                         "density": "compact",
                         "hover": True,
                         "fixed-header": True,
-                        "style": "min-width: 560px;",
+                        "style": "min-width: 0; font-size: 12px;",
                     },
                     "content": [
                         {
@@ -1106,7 +1109,7 @@ class FollowUp(_PluginBase):
                         "component": "div",
                         "props": {
                             "style": (
-                                "max-height: 360px; overflow: auto; "
+                                "max-height: 205px; overflow: auto; "
                                 "scrollbar-width: thin;"
                             ),
                         },
@@ -1325,22 +1328,40 @@ class FollowUp(_PluginBase):
                     },
                 ],
             },
-            table_card(
-                "最近自动订阅",
-                ["媒体", "季", "状态", "时间"],
-                [history_row(item) for item in history_records[:60]],
-                "暂无“续作跟进”自动订阅记录",
-                "历史表中的续作添加记录；保留最近 60 条",
-                total=len(history_records),
-            ),
-            table_card(
-                "待处理提醒",
-                ["媒体", "季", "状态", "提醒日期"],
-                [pending_row(item) for item in pending_records[:60]],
-                "暂无待处理的续作提醒",
-                "需要下一轮检查后继续处理的续作候选",
-                total=len(pending_records),
-            ),
+            {
+                "component": "VRow",
+                "props": {"class": "mt-1", "dense": True},
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6, "class": "py-0"},
+                        "content": [
+                            table_card(
+                                "最近自动订阅",
+                                ["媒体", "季", "状态", "时间"],
+                                [history_row(item) for item in history_records[:preview_limit]],
+                                "暂无“续作跟进”自动订阅记录",
+                                f"预览最近 {preview_limit} 条 · 共 {len(history_records)} 条",
+                                total=len(history_records),
+                            )
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6, "class": "py-0"},
+                        "content": [
+                            table_card(
+                                "待处理提醒",
+                                ["媒体", "季", "状态", "提醒日期"],
+                                [pending_row(item) for item in pending_records[:preview_limit]],
+                                "暂无待处理的续作提醒",
+                                f"预览最近 {preview_limit} 条 · 共 {len(pending_records)} 条",
+                                total=len(pending_records),
+                            )
+                        ],
+                    },
+                ],
+            },
         ]
 
     def get_state(self):
