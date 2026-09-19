@@ -1,14 +1,20 @@
 # 基础库
 import asyncio
 import html
+import os
 import re
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty, Queue
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
 # 第三方库
 from apscheduler.triggers.cron import CronTrigger
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers.polling import PollingObserver
 from pydantic import BaseModel, Field
 from sqlalchemy import tuple_
 from sqlalchemy.orm import Session
@@ -20,6 +26,7 @@ from app.core.config import global_vars, settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event
 from app.db.models.subscribehistory import SubscribeHistory
+from app.db.transferhistory_oper import TransferHistoryOper
 from app.db.subscribe_oper import SubscribeOper
 from app.db import db_query
 from app.helper.cookiecloud import CookieCloudHelper
@@ -92,8 +99,8 @@ class TraktCalendarEvent:
         }
 
 
-class FollowUpConfig(BaseModel):
-    """续作跟进插件配置"""
+class SubscriptionManagerConfig(BaseModel):
+    """订阅管理插件配置"""
     # 插件开关
     enabled: bool = False
     # 命中日历更新后自动添加订阅
@@ -114,42 +121,1323 @@ class FollowUpConfig(BaseModel):
     trakt_calendar_enabled: bool = False
     # 单次拉取范围；实际提醒仍受 after_days 约束
     trakt_calendar_days: int = Field(default=7, ge=1, le=30)
+    # 转移记录清理配置（从原 TransferCleaner 迁移）
+    notify: bool = True
+    dry_run: bool = True
+    delay_enabled: bool = False
+    delay_seconds: int = Field(default=10, ge=1, le=3600)
+    monitor_dirs: str = ""
+    path_mappings: str = ""
+    exclude_dirs: str = ""
+    exclude_keywords: str = ""
+    clean_dirs: str = ""
+    run_once: bool = False
+    retransfer_once: bool = False
+    retransfer_dirs: str = ""
+    retransfer_cron: str = ""
+    clean_failed: bool = False
 
 
-class FollowUp(_PluginBase):
+class FileMonitorHandler(FileSystemEventHandler):
+    """转移记录清理的目录事件处理器。"""
+
+    def __init__(self, monpath: str, plugin: Any, **kwargs):
+        super().__init__(**kwargs)
+        self._watch_path = monpath
+        self.plugin = plugin
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        self.plugin.handle_file_event("deleted", event.src_path)
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        self.plugin.handle_file_event("moved", event.src_path, event.dest_path)
+
+
+class TransferCleanupMixin:
+    """复用转移记录清理能力，生命周期由订阅管理插件统一调度。"""
+
+    _enabled: bool = False
+    _notify: bool = True
+    _dry_run: bool = True
+    _delay_enabled: bool = False
+    _delay_seconds: int = 10
+    _monitor_dirs: str = ""
+    _path_mappings: str = ""
+    _exclude_dirs: str = ""
+    _exclude_keywords: str = ""
+    _clean_dirs: str = ""
+    _run_once: bool = False
+    _retransfer_once: bool = False
+    _retransfer_dirs: str = ""
+    _retransfer_cron: str = ""
+    _clean_failed: bool = False
+    _observers: List[PollingObserver] = None
+    _transferhistory: Optional[TransferHistoryOper] = None
+    _event_cache: Dict[str, float] = None
+    _event_cache_lock: threading.Lock = None
+    _exclude_keywords_list: List[str] = None
+    _exclude_dirs_list: List[str] = None
+    _path_mappings_dict: Dict[str, str] = None
+    _reverse_mappings_dict: Dict[str, str] = None
+    _dedupe_ttl: int = 3
+    _temp_suffixes: List[str] = [".!qb", ".part", ".mp", ".tmp"]
+    _delay_queue: Queue = None
+    _delay_thread: threading.Thread = None
+    _stop_event: threading.Event = None
+    _notify_buffer: List[str] = None
+    _notify_buffer_lock: threading.Lock = None
+    _notify_timer: threading.Timer = None
+    _notify_delay: int = 30
+
+    def __update_transfer_config(self):
+        """将清理线程的瞬时状态写回统一配置，避免覆盖续作设置。"""
+        if hasattr(self, "_sync_transfer_config"):
+            self._sync_transfer_config()
+        self.update_config(self._get_config().model_dump())
+
+    def __update_config(self):
+        self.__update_transfer_config()
+
+    def _init_transfer_cleanup(self, config: dict = None):
+        """初始化插件"""
+        # 初始化实例属性（避免类级可变状态共享）
+        self._observers = []
+        self._event_cache = {}
+        self._event_cache_lock = threading.Lock()
+        self._exclude_keywords_list = []
+        self._exclude_dirs_list = []
+        self._path_mappings_dict = {}
+        self._reverse_mappings_dict = {}
+        self._delay_queue = Queue()
+        self._stop_event = threading.Event()
+        # 通知聚合初始化
+        self._notify_buffer = []
+        self._notify_buffer_lock = threading.Lock()
+        self._notify_timer = None
+
+        self._transferhistory = TransferHistoryOper()
+
+        if config:
+            self._enabled = config.get("enabled", False)
+            self._notify = config.get("notify", True)
+            self._dry_run = config.get("dry_run", True)
+            self._delay_enabled = config.get("delay_enabled", False)
+            self._delay_seconds = int(config.get("delay_seconds", 10) or 10)
+            self._monitor_dirs = config.get("monitor_dirs", "")
+            self._path_mappings = config.get("path_mappings", "")
+            self._exclude_dirs = config.get("exclude_dirs", "")
+            self._exclude_keywords = config.get("exclude_keywords", "")
+            self._clean_dirs = config.get("clean_dirs", "")
+            self._run_once = config.get("run_once", False)
+            self._retransfer_once = config.get("retransfer_once", False)
+            self._retransfer_dirs = config.get("retransfer_dirs", "")
+            self._retransfer_cron = config.get("retransfer_cron", "")
+            self._clean_failed = config.get("clean_failed", False)
+            # 预编译排除关键词列表
+            self._exclude_keywords_list = [
+                k.strip() for k in self._exclude_keywords.split("\n") if k.strip()
+            ]
+            # 预编译不删除目录列表
+            self._exclude_dirs_list = [
+                d.strip() for d in self._exclude_dirs.split("\n") if d.strip()
+            ]
+            # 预编译路径映射
+            self._path_mappings_dict = self._parse_path_mappings()
+            # 预编译反向路径映射（用于清理任务）
+            self._reverse_mappings_dict = {v: k for k, v in self._path_mappings_dict.items()}
+
+        logger.info(
+            f"订阅管理转移清理初始化，"
+            f"enabled={self._enabled}, dry_run={self._dry_run}, "
+            f"delay_enabled={self._delay_enabled}, delay_seconds={self._delay_seconds}, "
+            f"path_mappings={len(self._path_mappings_dict)}个"
+        )
+
+        # 停止现有监控
+        self._stop_transfer_cleanup()
+
+        if self._enabled:
+            self._start_monitoring()
+            # 启动延迟删除线程
+            if self._delay_enabled:
+                self._start_delay_worker()
+
+        # 检查是否需要立即运行清理任务
+        if self._run_once:
+            # 启动清理任务（在任务完成后重置开关）
+            threading.Thread(
+                target=self._run_cleanup_task_wrapper,
+                daemon=True,
+                name="SubscriptionManager-Cleanup"
+            ).start()
+
+        # 检查是否需要立即运行重新整理任务
+        if self._retransfer_once:
+            # 启动重新整理任务（在任务完成后重置开关）
+            threading.Thread(
+                target=self._run_retransfer_task_wrapper,
+                daemon=True,
+                name="SubscriptionManager-Retransfer"
+            ).start()
+
+    def _run_cleanup_task_wrapper(self):
+        """清理任务包装器，完成后重置开关"""
+        try:
+            self._run_cleanup_task()
+        finally:
+            # 重置开关
+            self._run_once = False
+            self.__update_config()
+
+    def _run_retransfer_task_wrapper(self):
+        """重新整理任务包装器（立即执行，不重置开关）"""
+        self._run_retransfer_task()
+
+    def _parse_path_mappings(self) -> Dict[str, str]:
+        """
+        解析路径映射配置
+        格式: 本地目录:存储路径
+        例如: /media/115/转存:/115/转存
+        返回: {本地路径前缀: 存储路径前缀}
+        """
+        mappings = {}
+        if not self._path_mappings:
+            return mappings
+
+        for line in self._path_mappings.split("\n"):
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            try:
+                # 格式: 本地目录:存储类型:存储路径 或 本地目录:存储路径
+                parts = line.split(":", 2)
+                if len(parts) == 2:
+                    # 本地目录:存储路径（存储路径可能包含存储类型前缀如 u115:）
+                    local_path = parts[0].strip()
+                    storage_path = parts[1].strip()
+                    mappings[local_path] = storage_path
+                elif len(parts) == 3:
+                    # 本地目录:存储类型:存储路径
+                    local_path = parts[0].strip()
+                    storage_type = parts[1].strip()
+                    storage_path = parts[2].strip()
+                    # 组合成完整的存储路径
+                    mappings[local_path] = f"{storage_type}:{storage_path}"
+                else:
+                    logger.warning(f"SubscriptionManager: 无效的路径映射配置: {line}")
+                    continue
+
+                logger.info(f"SubscriptionManager: 路径映射 {local_path} -> {mappings[local_path]}")
+
+            except Exception as e:
+                logger.warning(f"SubscriptionManager: 解析路径映射失败 {line}: {e}")
+
+        return mappings
+
+    def _convert_storage_to_local(self, storage_path: str) -> str:
+        """
+        将存储路径转换为本地路径（用于检查文件是否存在）
+
+        :param storage_path: 数据库中的存储路径
+        :return: 转换后的本地路径，如果没有匹配的映射则返回原路径
+        """
+        for storage_prefix, local_prefix in self._reverse_mappings_dict.items():
+            if storage_path.startswith(storage_prefix):
+                # 计算相对路径
+                relative_path = storage_path[len(storage_prefix):].lstrip("/")
+                # 构建本地路径
+                local_path = local_prefix.rstrip("/") + "/" + relative_path
+                return local_path
+
+        # 没有匹配的映射，返回原路径
+        return storage_path
+
+    def _check_file_exists(self, src_path: str) -> bool:
+        """
+        检查源文件是否存在（支持 CD2 路径和本地路径）
+
+        :param src_path: 数据库中的 src 路径
+        :return: 文件是否存在
+        """
+        # CD2 路径（如 /115open/115/转存/xxx.mkv）走 CD2 API 检查
+        if src_path.startswith("/115open/"):
+            return self._check_cd2_file_exists(src_path)
+        # 其他路径走本地 os.path.exists
+        return os.path.exists(src_path)
+
+    def _check_cd2_file_exists(self, storage_path: str) -> bool:
+        """
+        通过 CD2 储存接口检查文件是否存在
+        如果找不到 CD2 储存实例或调用失败，认为文件不存在（已上传成功）
+
+        :param storage_path: CD2 路径，如 /115open/115/转存/xxx.mkv
+        :return: 文件是否存在
+        """
+        try:
+            from app.modules.filemanager.storages import storages
+            for s in storages:
+                if s.__class__.__name__ == 'CloudDriveDisk':
+                    try:
+                        item = s.get_file_item(
+                            storage='CloudDrive储存',
+                            path=Path(storage_path)
+                        )
+                        return item is not None
+                    except Exception:
+                        pass
+            # 找不到 CD2 storage 实例，认为文件不存在（假失败场景）
+            return False
+        except Exception:
+            return False
+
+    def _run_cleanup_task(self):
+        """
+        运行清理任务：扫描数据库中的转移记录，检查源文件是否存在，
+        如果不存在则删除对应的记录
+        """
+        logger.info("SubscriptionManager: 开始运行清理任务...")
+
+        # 直接使用监控目录
+        clean_dirs = [d.strip() for d in self._monitor_dirs.split("\n") if d.strip()]
+
+        if not clean_dirs:
+            logger.warning("SubscriptionManager: 未配置监控目录，跳过清理任务")
+            self.systemmessage.put("未配置监控目录，请先配置监控目录", title="转移记录清理")
+            return
+
+        # 将本地目录转换为存储路径前缀（用于数据库查询）
+        storage_prefixes = []
+        for local_dir in clean_dirs:
+            storage_path = self._convert_path_to_storage(local_dir)
+            storage_prefixes.append(storage_path)
+            logger.info(f"SubscriptionManager: 清理目录映射 {local_dir} -> {storage_path}")
+
+        # 统计
+        total_checked = 0
+        total_deleted = 0
+        deleted_records = []
+
+        try:
+            from sqlalchemy import desc
+            from app.db.models.transferhistory import TransferHistory
+            from app.db import SessionFactory
+
+            with SessionFactory() as db:
+                # 遍历每个存储路径前缀
+                for storage_prefix in storage_prefixes:
+                    logger.info(f"SubscriptionManager: 扫描存储路径前缀 {storage_prefix}")
+
+                    # 查询匹配的记录
+                    records = db.query(TransferHistory).filter(
+                        TransferHistory.src.like(f"{storage_prefix}%")
+                    ).order_by(desc(TransferHistory.id)).all()
+
+                    logger.info(f"SubscriptionManager: 找到 {len(records)} 条匹配记录")
+
+                    for record in records:
+                        total_checked += 1
+
+                        # 检查文件是否存在（支持 CD2 路径）
+                        file_exists = self._check_file_exists(record.src)
+                        if file_exists:
+                            continue
+
+                        # 文件不存在，需要删除记录
+                        if self._dry_run:
+                            logger.info(
+                                f"[DryRun] SubscriptionManager: 将删除记录 "
+                                f"ID={record.id}, src={record.src}"
+                            )
+                            total_deleted += 1
+                            deleted_records.append({
+                                "id": record.id,
+                                "src": record.src,
+                                "title": getattr(record, 'title', '')
+                            })
+                        else:
+                            self._transferhistory.delete(record.id)
+                            logger.info(
+                                f"SubscriptionManager: 已删除记录 "
+                                f"ID={record.id}, src={record.src}"
+                            )
+                            total_deleted += 1
+                            deleted_records.append({
+                                "id": record.id,
+                                "src": record.src,
+                                "title": getattr(record, 'title', '')
+                            })
+
+                        # 防止删除过多
+                        if total_deleted >= 1000:
+                            logger.warning("SubscriptionManager: 达到单次清理上限 1000 条")
+                            break
+
+                    if total_deleted >= 1000:
+                        break
+
+        except Exception as e:
+            logger.exception("SubscriptionManager: 清理任务异常")
+            self.systemmessage.put(f"清理任务异常: {str(e)}", title="转移记录清理")
+            return
+
+        # 发送通知
+        dry_run_tag = "[模拟] " if self._dry_run else ""
+        summary = f"{dry_run_tag}清理任务完成\n"
+        summary += f"扫描记录: {total_checked} 条\n"
+        summary += f"{'将删除' if self._dry_run else '已删除'}: {total_deleted} 条\n"
+
+        if deleted_records and len(deleted_records) <= 10:
+            summary += "\n详情:\n"
+            for r in deleted_records[:10]:
+                title = r.get('title', '')
+                if title:
+                    summary += f"- {title}\n"
+                else:
+                    summary += f"- ID:{r['id']}\n"
+
+        logger.info(f"SubscriptionManager: {summary}")
+
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=f"【转移记录清理】{dry_run_tag}",
+                text=summary
+            )
+
+        # 如果开启了清理失败记录，继续执行
+        if self._clean_failed:
+            self._run_clean_failed_task()
+
+    def _run_clean_failed_task(self):
+        """
+        清理/重试失败记录：
+        - 源文件不存在（说明已上传成功）：删除失败记录
+        - 源文件仍存在（说明确实失败了）：删除记录并重新整理
+        """
+        logger.info("SubscriptionManager: 开始处理失败记录...")
+
+        total_checked = 0
+        deleted_count = 0
+        retry_count = 0
+
+        try:
+            from sqlalchemy import desc
+            from app.db.models.transferhistory import TransferHistory
+            from app.db import SessionFactory
+            from app.chain.transfer import TransferChain
+
+            transfer_chain = None
+            if not self._dry_run:
+                try:
+                    transfer_chain = TransferChain()
+                except ImportError:
+                    logger.error("SubscriptionManager: 无法导入 TransferChain")
+
+            with SessionFactory() as db:
+                # 查询所有失败的记录
+                records = db.query(TransferHistory).filter(
+                    TransferHistory.status == False
+                ).order_by(desc(TransferHistory.id)).limit(500).all()
+
+                logger.info(f"SubscriptionManager: 找到 {len(records)} 条失败记录")
+
+                for record in records:
+                    total_checked += 1
+
+                    # 将存储路径转换为本地路径，检查文件是否存在（支持 CD2 路径）
+                    local_path = self._convert_storage_to_local(record.src)
+                    file_exists = self._check_file_exists(record.src)
+
+                    if file_exists:
+                        # 源文件存在，说明确实失败了，需要重试
+                        if self._dry_run:
+                            logger.info(
+                                f"[DryRun] SubscriptionManager: 将重试整理 "
+                                f"ID={record.id}, src={record.src}"
+                            )
+                            retry_count += 1
+                        else:
+                            # 删除旧记录并重新整理
+                            self._transferhistory.delete(record.id)
+                            logger.info(f"SubscriptionManager: 已删除失败记录 ID={record.id}")
+
+                            if transfer_chain:
+                                try:
+                                    transfer_chain.process(Path(local_path))
+                                    retry_count += 1
+                                    logger.info(f"SubscriptionManager: 已触发重新整理 {local_path}")
+                                except Exception as e:
+                                    logger.exception(f"SubscriptionManager: 重新整理失败 {local_path}")
+                    else:
+                        # 源文件不存在，说明实际已上传成功，删除错误记录
+                        if self._dry_run:
+                            logger.info(
+                                f"[DryRun] SubscriptionManager: 将删除假失败记录 "
+                                f"ID={record.id}, src={record.src}"
+                            )
+                            deleted_count += 1
+                        else:
+                            self._transferhistory.delete(record.id)
+                            logger.info(
+                                f"SubscriptionManager: 已删除假失败记录 "
+                                f"ID={record.id}, src={record.src}"
+                            )
+                            deleted_count += 1
+
+                    if deleted_count + retry_count >= 100:
+                        logger.warning("SubscriptionManager: 达到单次处理上限 100 条")
+                        break
+
+        except Exception as e:
+            logger.exception("SubscriptionManager: 处理失败记录异常")
+            return
+
+        if deleted_count > 0 or retry_count > 0:
+            dry_run_tag = "[模拟] " if self._dry_run else ""
+            summary = f"{dry_run_tag}处理失败记录完成\n"
+            summary += f"检查失败记录: {total_checked} 条\n"
+            if deleted_count > 0:
+                summary += f"{'将删除' if self._dry_run else '已删除'}假失败记录: {deleted_count} 条\n"
+            if retry_count > 0:
+                summary += f"{'将重试' if self._dry_run else '已重试'}整理: {retry_count} 条\n"
+
+            logger.info(f"SubscriptionManager: {summary}")
+
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.SiteMessage,
+                    title=f"【转移记录清理】{dry_run_tag}失败记录处理",
+                    text=summary
+                )
+
+    def _run_retransfer_task(self):
+        """
+        运行重新整理任务：扫描已有转移记录但源文件仍存在的情况，
+        说明文件没有成功上传，需要重新整理
+        """
+        logger.info("SubscriptionManager: 开始运行重新整理检测任务...")
+
+        # 使用用户配置的重新整理检测目录
+        retransfer_dirs = [d.strip() for d in self._retransfer_dirs.split("\n") if d.strip()]
+        if not retransfer_dirs:
+            logger.warning("SubscriptionManager: 未配置重新整理检测目录，跳过")
+            return
+
+        # 统计
+        total_checked = 0
+        need_retransfer = []
+
+        try:
+            from sqlalchemy import desc
+            from app.db.models.transferhistory import TransferHistory
+            from app.db import SessionFactory
+
+            with SessionFactory() as db:
+                for check_dir in retransfer_dirs:
+                    logger.info(f"SubscriptionManager: 检测目录 {check_dir}")
+
+                    # 查询源路径在该目录下的记录
+                    records = db.query(TransferHistory).filter(
+                        TransferHistory.src.like(f"{check_dir}%")
+                    ).order_by(desc(TransferHistory.id)).limit(2000).all()
+
+                    logger.info(f"SubscriptionManager: 找到 {len(records)} 条匹配记录")
+
+                    for record in records:
+                        total_checked += 1
+                        src_path = record.src
+
+                        # 检查源文件是否仍然存在（支持 CD2 路径）
+                        src_path = record.src
+                        file_exists = self._check_file_exists(src_path)
+                        if file_exists:
+                            # 源文件仍存在，说明可能没有成功上传
+                            need_retransfer.append({
+                                "id": record.id,
+                                "src": src_path,
+                                "dest": record.dest,
+                                "title": getattr(record, 'title', ''),
+                            })
+                            logger.info(
+                                f"SubscriptionManager: 发现未上传文件 "
+                                f"ID={record.id}, src={src_path}"
+                            )
+
+                        if len(need_retransfer) >= 500:
+                            logger.warning("SubscriptionManager: 达到单次检测上限 500 条")
+                            break
+
+                    if len(need_retransfer) >= 500:
+                        break
+
+        except Exception as e:
+            logger.exception("SubscriptionManager: 重新整理检测任务异常")
+            self.systemmessage.put(f"重新整理检测异常: {str(e)}", title="转移记录清理")
+            return
+
+        # 处理需要重新整理的文件
+        retransfer_count = 0
+        if need_retransfer and not self._dry_run:
+            try:
+                from app.chain.transfer import TransferChain
+                transfer_chain = TransferChain()
+
+                for item in need_retransfer:
+                    src_path = item["src"]
+                    try:
+                        # 先删除旧的转移记录
+                        self._transferhistory.delete(item["id"])
+                        logger.info(f"SubscriptionManager: 已删除旧记录 ID={item['id']}")
+
+                        # 触发重新整理
+                        transfer_chain.process(Path(src_path))
+                        retransfer_count += 1
+                        logger.info(f"SubscriptionManager: 已触发重新整理 {src_path}")
+
+                    except Exception as e:
+                        logger.exception(f"SubscriptionManager: 重新整理失败 {src_path}")
+
+            except ImportError:
+                logger.error("SubscriptionManager: 无法导入 TransferChain，跳过重新整理")
+
+        # 发送通知
+        dry_run_tag = "[模拟] " if self._dry_run else ""
+        summary = f"{dry_run_tag}重新整理检测完成\n"
+        summary += f"扫描记录: {total_checked} 条\n"
+        summary += f"发现未上传: {len(need_retransfer)} 条\n"
+        if not self._dry_run:
+            summary += f"已重新整理: {retransfer_count} 条\n"
+
+        if need_retransfer and len(need_retransfer) <= 10:
+            summary += "\n详情:\n"
+            for r in need_retransfer[:10]:
+                title = r.get('title', '')
+                if title:
+                    summary += f"- {title}\n"
+                else:
+                    src = r.get('src', '')
+                    summary += f"- {Path(src).name}\n"
+
+        logger.info(f"SubscriptionManager: {summary}")
+
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=f"【转移记录清理】{dry_run_tag}重新整理",
+                text=summary
+            )
+
+    def _convert_path_to_storage(self, local_path: str) -> str:
+        """
+        将本地路径转换为存储路径（用于匹配 TransferHistory.src）
+
+        :param local_path: 本地文件路径
+        :return: 转换后的存储路径，如果没有匹配的映射则返回原路径
+        """
+        for local_prefix, storage_prefix in self._path_mappings_dict.items():
+            if local_path.startswith(local_prefix):
+                # 计算相对路径
+                relative_path = local_path[len(local_prefix):].lstrip("/")
+                # 构建存储路径
+                storage_path = storage_prefix.rstrip("/") + "/" + relative_path
+                logger.debug(f"SubscriptionManager: 路径转换 {local_path} -> {storage_path}")
+                return storage_path
+
+        # 没有匹配的映射，返回原路径
+        return local_path
+
+    def _start_monitoring(self):
+        """启动目录监控"""
+        monitor_dirs = [d.strip() for d in self._monitor_dirs.split("\n") if d.strip()]
+
+        if not monitor_dirs:
+            logger.warning("SubscriptionManager: 未配置监控目录")
+            return
+
+        logger.info(f"SubscriptionManager: 监控目录列表 {monitor_dirs}")
+
+        for mon_path in monitor_dirs:
+            if not os.path.isdir(mon_path):
+                logger.warning(f"SubscriptionManager: 监控目录不存在 {mon_path}")
+                continue
+
+            try:
+                # 使用兼容模式（轮询），适用于网络挂载目录
+                observer = PollingObserver(timeout=10)
+
+                self._observers.append(observer)
+                observer.schedule(
+                    FileMonitorHandler(mon_path, self),
+                    mon_path,
+                    recursive=True
+                )
+                observer.daemon = True
+                observer.start()
+
+                logger.info(f"SubscriptionManager: {mon_path} 目录监控启动 [兼容模式], observer.is_alive={observer.is_alive()}")
+
+            except Exception as e:
+                logger.exception(f"SubscriptionManager: 启动目录监控失败 {mon_path}")
+                self.systemmessage.put(
+                    f"启动目录监控失败：{mon_path}\n{str(e)}",
+                    title="转移记录清理"
+                )
+
+    def _start_delay_worker(self):
+        """启动延迟删除工作线程"""
+        self._delay_thread = threading.Thread(
+            target=self._delay_worker_loop,
+            daemon=True,
+            name="SubscriptionManager-DelayWorker"
+        )
+        self._delay_thread.start()
+        logger.info(f"SubscriptionManager: 延迟删除线程启动，延迟 {self._delay_seconds} 秒")
+
+    def _delay_worker_loop(self):
+        """延迟删除工作线程主循环"""
+        while not self._stop_event.is_set():
+            try:
+                # 从队列获取事件，超时1秒
+                event_data = self._delay_queue.get(timeout=1)
+            except Empty:
+                continue
+
+            event_type = event_data["event_type"]
+            src_path = event_data["src_path"]
+            dest_path = event_data.get("dest_path")
+            event_time = event_data["event_time"]
+
+            # 计算需要等待的时间
+            elapsed = time.time() - event_time
+            wait_time = self._delay_seconds - elapsed
+
+            if wait_time > 0:
+                # 等待剩余时间，但要检查停止信号
+                if self._stop_event.wait(wait_time):
+                    break
+
+            # 检查文件是否仍然不存在（确认删除）
+            if os.path.exists(src_path):
+                logger.info(
+                    f"SubscriptionManager: 延迟检查发现文件已恢复，跳过 {src_path}"
+                )
+                continue
+
+            # 执行删除历史记录
+            deleted = self._process_delete(event_type, src_path, dest_path)
+            # 如果未删除任何记录，从去重缓存移除，允许后续事件重试
+            if not deleted:
+                self._remove_from_event_cache(src_path)
+
+    def handle_file_event(self, event_type: str, src_path: str, dest_path: str = None):
+        """
+        处理文件事件
+
+        :param event_type: 事件类型 (deleted/moved)
+        :param src_path: 源路径（用于匹配历史记录）
+        :param dest_path: 目标路径（仅移动事件有）
+        """
+        try:
+            file_path = Path(src_path)
+
+            # 过滤临时文件
+            if file_path.suffix.lower() in self._temp_suffixes:
+                return
+
+            # 检查是否在不删除目录中
+            if self._is_in_exclude_dirs(src_path):
+                logger.debug(f"SubscriptionManager: 路径在不删除目录中，跳过 {src_path}")
+                return
+
+            # 过滤排除关键词
+            if self._should_exclude(src_path):
+                logger.debug(f"SubscriptionManager: 路径命中排除关键词，跳过 {src_path}")
+                return
+
+            # 事件去重
+            if self._is_duplicate_event(src_path):
+                logger.info(f"SubscriptionManager: 重复事件，跳过 {src_path}")
+                return
+
+            logger.info(f"SubscriptionManager: 检测到文件{event_type}事件 - {src_path}")
+
+            if self._delay_enabled:
+                # 加入延迟队列
+                self._delay_queue.put({
+                    "event_type": event_type,
+                    "src_path": src_path,
+                    "dest_path": dest_path,
+                    "event_time": time.time()
+                })
+                logger.debug(f"SubscriptionManager: 事件加入延迟队列，{self._delay_seconds}秒后处理")
+            else:
+                # 立即处理
+                deleted = self._process_delete(event_type, src_path, dest_path)
+                # 如果未删除任何记录，从去重缓存移除，允许后续事件重试
+                if not deleted:
+                    self._remove_from_event_cache(src_path)
+
+        except Exception as e:
+            logger.exception(f"SubscriptionManager: 处理事件异常 {src_path}")
+
+    def _process_delete(self, event_type: str, src_path: str, dest_path: str = None) -> bool:
+        """
+        实际执行删除历史记录
+
+        :return: 是否成功删除了记录
+        """
+        # 规范化路径
+        normalized_path = self._normalize_path(src_path)
+
+        # 应用路径映射转换
+        storage_path = self._convert_path_to_storage(normalized_path)
+
+        # 先尝试精确匹配（快速路径）
+        result = self._delete_history_by_src(storage_path, event_type)
+
+        # 精确匹配失败，尝试原路径
+        if result["deleted_count"] == 0 and storage_path != normalized_path:
+            logger.debug(f"SubscriptionManager: 存储路径未匹配，尝试原路径 {normalized_path}")
+            result = self._delete_history_by_src(normalized_path, event_type)
+
+        # 精确匹配全部失败，使用 LIKE 模糊匹配（处理路径格式差异）
+        if result["deleted_count"] == 0:
+            logger.info(f"SubscriptionManager: 精确匹配未找到记录，尝试模糊匹配 {storage_path}")
+            result = self._delete_history_by_like(storage_path, normalized_path, event_type)
+
+        if result["deleted_count"] == 0:
+            logger.warning(f"SubscriptionManager: 未找到匹配的转移记录 {src_path}")
+
+        # 发送通知
+        if result["deleted_count"] > 0 and self._notify:
+            self._send_notification(event_type, storage_path, dest_path, result)
+
+        # 异常导致的失败也视为未成功，允许重试
+        return result["deleted_count"] > 0 and not result.get("error")
+
+    def _normalize_path(self, path: str) -> str:
+        """路径规范化"""
+        # 转换为绝对路径
+        normalized = os.path.abspath(path)
+        # 统一分隔符
+        normalized = normalized.replace("\\", "/")
+        # 去除尾部斜杠
+        normalized = normalized.rstrip("/")
+        return normalized
+
+    def _is_in_exclude_dirs(self, path: str) -> bool:
+        """检查路径是否在不删除目录中"""
+        if not self._exclude_dirs_list:
+            return False
+
+        for exclude_dir in self._exclude_dirs_list:
+            if path.startswith(exclude_dir):
+                return True
+        return False
+
+    def _should_exclude(self, path: str) -> bool:
+        """检查路径是否应该排除（使用预编译的关键词列表）"""
+        if not self._exclude_keywords_list:
+            return False
+
+        for keyword in self._exclude_keywords_list:
+            if keyword in path:
+                return True
+        return False
+
+    def _is_duplicate_event(self, path: str) -> bool:
+        """检查是否为重复事件"""
+        current_time = time.time()
+
+        with self._event_cache_lock:
+            # 清理过期缓存
+            expired_keys = [
+                k for k, v in self._event_cache.items()
+                if current_time - v > self._dedupe_ttl
+            ]
+            for k in expired_keys:
+                del self._event_cache[k]
+
+            # 检查是否重复
+            if path in self._event_cache:
+                return True
+
+            # 记录事件
+            self._event_cache[path] = current_time
+            return False
+
+    def _remove_from_event_cache(self, path: str):
+        """从去重缓存中移除路径，允许后续事件重试"""
+        with self._event_cache_lock:
+            self._event_cache.pop(path, None)
+
+    def _delete_history_by_src(self, src_path: str, reason: str) -> dict:
+        """
+        根据源路径删除转移历史记录
+
+        :return: {"deleted_count": int, "deleted_ids": list, "dry_run": bool}
+        """
+        result = {
+            "deleted_count": 0,
+            "deleted_ids": [],
+            "dry_run": self._dry_run
+        }
+
+        # 删除上限保护，防止异常数据导致长循环
+        max_delete_count = 100
+
+        try:
+            # 循环删除直到没有匹配记录（处理重复记录）
+            while result["deleted_count"] < max_delete_count:
+                history = self._transferhistory.get_by_src(src_path)
+                if not history:
+                    break
+
+                result["deleted_ids"].append(history.id)
+                result["deleted_count"] += 1
+
+                if self._dry_run:
+                    logger.info(
+                        f"[DryRun] SubscriptionManager: 将删除历史记录 "
+                        f"ID={history.id}, src={src_path}"
+                    )
+                    break  # Dry Run 模式只检查一次
+                else:
+                    self._transferhistory.delete(history.id)
+                    logger.info(
+                        f"SubscriptionManager: 已删除历史记录 "
+                        f"ID={history.id}, src={src_path}, reason={reason}"
+                    )
+
+            if result["deleted_count"] >= max_delete_count:
+                logger.warning(
+                    f"SubscriptionManager: 达到删除上限 {max_delete_count}，"
+                    f"src={src_path} 可能存在异常数据"
+                )
+
+        except Exception as e:
+            logger.exception(f"SubscriptionManager: 删除历史记录异常 {src_path}")
+
+        return result
+
+    def _delete_history_by_like(self, storage_path: str, local_path: str, reason: str) -> dict:
+        """
+        使用 LIKE 受限模糊匹配删除转移历史记录（处理路径格式差异）
+        匹配策略：目录前缀 + 文件名，避免跨目录误删
+
+        :param storage_path: 转换后的存储路径
+        :param local_path: 原始本地路径（用于构建目录约束）
+        :param reason: 删除原因
+        :return: {"deleted_count": int, "deleted_ids": list, "dry_run": bool}
+        """
+        result = {
+            "deleted_count": 0,
+            "deleted_ids": [],
+            "dry_run": self._dry_run
+        }
+
+        try:
+            from app.db.models.transferhistory import TransferHistory
+            from app.db import SessionFactory
+
+            # 提取文件名用于匹配
+            filename = Path(storage_path).name
+            if not filename:
+                return result
+
+            # 转义 LIKE 通配符（防止文件名中的 % _ 被当作模式字符）
+            escaped_filename = filename.replace("%", "\\%").replace("_", "\\_")
+
+            # 构建目录前缀候选列表（约束匹配范围，防止跨目录误删）
+            dir_prefixes = set()
+            for candidate in [storage_path, local_path]:
+                parent = str(Path(candidate).parent)
+                if parent and parent != ".":
+                    # 取上两级目录作为前缀（兼容子目录结构差异）
+                    grandparent = str(Path(parent).parent)
+                    if grandparent and grandparent != ".":
+                        escaped_gp = grandparent.replace("%", "\\%").replace("_", "\\_")
+                        dir_prefixes.add(escaped_gp)
+                    escaped_parent = parent.replace("%", "\\%").replace("_", "\\_")
+                    dir_prefixes.add(escaped_parent)
+
+            with SessionFactory() as db:
+                from sqlalchemy import or_
+
+                if dir_prefixes:
+                    # 受限匹配：目录前缀 + 文件名
+                    conditions = [
+                        TransferHistory.src.like(f"{prefix}%{escaped_filename}", escape="\\")
+                        for prefix in dir_prefixes
+                    ]
+                    records = db.query(TransferHistory).filter(
+                        or_(*conditions)
+                    ).limit(10).all()
+                else:
+                    # 无目录信息时的保守匹配：完整路径尾部匹配 + 严格 limit
+                    records = db.query(TransferHistory).filter(
+                        TransferHistory.src.like(f"%/{escaped_filename}", escape="\\")
+                    ).limit(5).all()
+
+                if not records:
+                    return result
+
+                logger.info(
+                    f"SubscriptionManager: 模糊匹配找到 {len(records)} 条记录 "
+                    f"(文件名={filename}, 目录约束={len(dir_prefixes)}个)"
+                )
+
+                for record in records:
+                    result["deleted_ids"].append(record.id)
+                    result["deleted_count"] += 1
+
+                    if self._dry_run:
+                        logger.info(
+                            f"[DryRun] SubscriptionManager: 将删除历史记录 "
+                            f"ID={record.id}, src={record.src}"
+                        )
+                    else:
+                        self._transferhistory.delete(record.id)
+                        logger.info(
+                            f"SubscriptionManager: 已删除历史记录 "
+                            f"ID={record.id}, src={record.src}, reason={reason}"
+                        )
+
+        except Exception as e:
+            logger.exception(f"SubscriptionManager: 模糊匹配删除异常 {storage_path}")
+            # 标记为失败，让调用方知道不是"未找到"而是"执行出错"
+            result["error"] = True
+
+        return result
+
+    def _send_notification(self, event_type: str, src_path: str,
+                          dest_path: str, result: dict):
+        """发送通知"""
+        dry_run_tag = "[模拟] " if result["dry_run"] else ""
+
+        # 提取文件名并加入通知缓冲区
+        file_name = Path(src_path).name
+        self._add_to_notify_buffer(file_name, result["dry_run"])
+
+    def _add_to_notify_buffer(self, file_name: str, dry_run: bool):
+        """将文件名加入通知缓冲区，延迟聚合发送"""
+        with self._notify_buffer_lock:
+            self._notify_buffer.append(file_name)
+
+            # 取消现有定时器
+            if self._notify_timer:
+                self._notify_timer.cancel()
+
+            # 设置新的定时器
+            self._notify_timer = threading.Timer(
+                self._notify_delay,
+                self._flush_notify_buffer,
+                args=[dry_run]
+            )
+            self._notify_timer.daemon = True
+            self._notify_timer.start()
+
+    def _flush_notify_buffer(self, dry_run: bool = False):
+        """发送聚合通知"""
+        with self._notify_buffer_lock:
+            if not self._notify_buffer:
+                return
+
+            files = self._notify_buffer.copy()
+            self._notify_buffer.clear()
+
+        dry_run_tag = "[模拟] " if dry_run else ""
+        count = len(files)
+
+        title = f"【转移记录清理】{dry_run_tag}已删除 {count} 条记录"
+
+        # 按剧集/系列名分组
+        groups = self._group_files_by_series(files)
+
+        text_parts = []
+        for series_name, episode_files in groups.items():
+            if len(episode_files) == 1:
+                text_parts.append(f"· {episode_files[0]}")
+            else:
+                # 提取集数信息，紧凑显示
+                episodes = self._extract_episode_numbers(episode_files)
+                if episodes:
+                    text_parts.append(f"· {series_name} ({len(episode_files)}集: {episodes})")
+                else:
+                    text_parts.append(f"· {series_name} ({len(episode_files)}个文件)")
+
+        # 限制通知长度
+        if len(text_parts) > 10:
+            text = "\n".join(text_parts[:10]) + f"\n... 等共 {len(text_parts)} 个系列"
+        else:
+            text = "\n".join(text_parts)
+
+        self.post_message(
+            mtype=NotificationType.SiteMessage,
+            title=title,
+            text=text
+        )
+
+    def _group_files_by_series(files: List[str]) -> Dict[str, List[str]]:
+        """按剧集/系列名分组文件"""
+        import re
+        groups: Dict[str, List[str]] = {}
+
+        for f in files:
+            # 尝试提取系列名（匹配到 S01E01 / EP01 / E01 之前的部分）
+            match = re.match(r'^(.*?)[.\s]S\d+E\d+', f, re.IGNORECASE)
+            if not match:
+                match = re.match(r'^(.*?)[.\s](?:EP?\d+)', f, re.IGNORECASE)
+
+            if match:
+                series = match.group(1).strip().rstrip('.')
+            else:
+                series = f  # 无法提取系列名，用完整文件名
+
+            if series not in groups:
+                groups[series] = []
+            groups[series].append(f)
+
+        return groups
+
+    def _extract_episode_numbers(files: List[str]) -> str:
+        """从文件名列表提取集数信息，返回紧凑的集数字符串"""
+        import re
+        episodes = set()
+        for f in files:
+            # 匹配 S01E03, E03, EP03 等
+            match = re.search(r'[.\s]S\d+E(\d+)', f, re.IGNORECASE)
+            if not match:
+                match = re.search(r'[.\s]EP?(\d+)', f, re.IGNORECASE)
+            if match:
+                episodes.add(int(match.group(1)))
+
+        if not episodes:
+            return ""
+
+        sorted_eps = sorted(episodes)
+        # 生成紧凑范围表示: [1,2,3,5,7,8] -> "E01-E03, E05, E07-E08"
+        ranges = []
+        start = sorted_eps[0]
+        end = sorted_eps[0]
+        for ep in sorted_eps[1:]:
+            if ep == end + 1:
+                end = ep
+            else:
+                ranges.append(f"E{start:02d}-E{end:02d}" if start != end else f"E{start:02d}")
+                start = end = ep
+        ranges.append(f"E{start:02d}-E{end:02d}" if start != end else f"E{start:02d}")
+
+        return ", ".join(ranges)
+
+    def _run_scheduled_task(self):
+        """
+        定时任务：执行检测未上传和清理假失败
+        """
+        logger.info(
+            f"SubscriptionManager: 定时任务开始，执行清理与重新整理 "
+            f"(clean_failed={self._clean_failed})"
+        )
+        try:
+            self._run_cleanup_task()
+            self._run_retransfer_task()
+            if self._clean_failed:
+                self._run_clean_failed_task()
+        finally:
+            logger.info("SubscriptionManager: 定时任务结束")
+
+    def _stop_transfer_cleanup(self):
+        """停止服务"""
+        # 停止延迟删除线程
+        if self._stop_event:
+            self._stop_event.set()
+        if self._delay_thread and self._delay_thread.is_alive():
+            self._delay_thread.join(timeout=5)
+            logger.info("SubscriptionManager: 延迟删除线程已停止")
+
+        # 刷新并停止通知定时器（防止停服后丢通知）
+        if self._notify_timer:
+            self._notify_timer.cancel()
+            self._notify_timer = None
+        # 发送缓冲区中残留的通知
+        if self._notify_buffer and len(self._notify_buffer) > 0:
+            try:
+                self._flush_notify_buffer(self._dry_run)
+            except Exception:
+                pass
+
+        # 停止目录监控
+        if self._observers:
+            for observer in self._observers:
+                try:
+                    observer.stop()
+                    observer.join(timeout=5)
+                except Exception as e:
+                    logger.exception("SubscriptionManager: 停止监控异常")
+            self._observers = []
+            logger.info("SubscriptionManager: 目录监控已停止")
+
+    def _get_transfer_service(self) -> List[Dict[str, Any]]:
+        """
+        注册定时任务
+        """
+        if not self._enabled:
+            return []
+
+        cron_exp = (self._retransfer_cron or "").strip()
+        if not cron_exp:
+            return []
+
+        try:
+            trigger = CronTrigger.from_crontab(cron_exp)
+        except Exception as e:
+            logger.error(f"SubscriptionManager: 无效的定时任务表达式 `{cron_exp}`: {e}")
+            return []
+
+        return [{
+            "id": "SubscriptionManagerTransferCleanup",
+            "name": "转移记录清理",
+            "trigger": trigger,
+            "func": self._run_scheduled_task,
+            "kwargs": {}
+        }]
+
+
+class SubscriptionManager(TransferCleanupMixin, _PluginBase):
     # 插件名称
-    plugin_name = "续作跟进"
+    plugin_name = "订阅管理"
     # 插件描述
-    plugin_desc = "根据媒体库、订阅历史和可选 CookieCloud Trakt 日历检查续作并自动订阅"
+    plugin_desc = "统一管理续作订阅、Trakt 日历提醒和转移记录清理"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/i-kirito/MoviePilot-FollowUp/main/icons/followup.png"
+    plugin_icon = "https://raw.githubusercontent.com/i-kirito/MoviePilot-SubscriptionManager/main/icons/followup.png"
     # 插件版本
-    plugin_version = "1.6.4"
+    plugin_version = "1.0.0"
     # 插件作者
     plugin_author = "i-kirito"
     # 作者主页
     author_url = "https://github.com/i-kirito"
     # 插件配置项ID前缀
-    plugin_config_prefix = "followup_"
+    plugin_config_prefix = "subscriptionmanager_"
     # 加载顺序
     plugin_order = 99
     # 可使用的用户级别
     auth_level = 2
+
+    # 订阅历史保留旧版“续作跟进”归属，新记录使用统一插件名。
+    subscription_owner_names = ("订阅管理", "续作跟进")
+
+    _transfer_config_keys = (
+        "notify", "dry_run", "delay_enabled", "delay_seconds",
+        "monitor_dirs", "path_mappings", "exclude_dirs", "exclude_keywords",
+        "clean_dirs", "run_once", "retransfer_once", "retransfer_dirs",
+        "retransfer_cron", "clean_failed",
+    )
+
+    def _merge_legacy_config(self, config: Optional[dict]) -> dict:
+        """合并旧 FollowUp/TransferCleaner 配置，优先保留新插件已保存值。"""
+        merged = {}
+        legacy_followup = self.systemconfig.get("plugin.FollowUp") or {}
+        legacy_transfer = self.systemconfig.get("plugin.TransferCleaner") or {}
+        if isinstance(legacy_followup, dict):
+            merged.update(legacy_followup)
+        if isinstance(legacy_transfer, dict):
+            for key, value in legacy_transfer.items():
+                if key != "enabled":
+                    merged.setdefault(key, value)
+            if "enabled" not in merged:
+                merged["enabled"] = legacy_transfer.get("enabled", False)
+        if isinstance(config, dict):
+            merged.update(config)
+        return merged
+
+    def _migrate_legacy_data(self) -> None:
+        """迁移 FollowUp 的插件数据，保留订阅忽略项、Trakt 状态和集合缓存。"""
+        try:
+            legacy_rows = self.plugindata.get_data_all("FollowUp") or []
+            for row in legacy_rows:
+                key = getattr(row, "key", None)
+                if not isinstance(key, str):
+                    continue
+                if self.plugindata.get_data("SubscriptionManager", key) is None:
+                    self.plugindata.save("SubscriptionManager", key, getattr(row, "value", None))
+        except Exception as exc:
+            logger.warning(f"迁移续作跟进插件数据失败：{exc}")
+
+    def _sync_transfer_config(self) -> None:
+        config = self._get_config()
+        for key in self._transfer_config_keys:
+            if hasattr(self, f"_{key}"):
+                setattr(config, key, getattr(self, f"_{key}"))
+
+    def _transfer_form_sections(self) -> list[dict]:
+        return [
+            {
+                "component": "VDivider",
+                "props": {"class": "my-2"},
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "title": "转移记录清理",
+                    "text": "与续作订阅共用一个插件开关；监控目录中的文件移动/删除后，自动清理对应的转移历史。保留模拟运行和目标存在性校验。",
+                },
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送清理通知"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "dry_run", "label": "模拟运行"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delay_enabled", "label": "延迟删除"}}]},
+                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delay_seconds", "label": "延迟秒数", "type": "number", "min": 1, "max": 3600}}]},
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "run_once", "label": "立即清理一次"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "clean_failed", "label": "清理假失败记录"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "retransfer_cron", "label": "清理定时周期", "placeholder": "0 */2 * * *"}}]},
+                ],
+            },
+            {"component": "VTextarea", "props": {"model": "monitor_dirs", "label": "监控目录（每行一个）", "rows": 2, "placeholder": "/media/待上传\n/media/downloads"}},
+            {"component": "VTextarea", "props": {"model": "path_mappings", "label": "路径映射（每行一个）", "rows": 2, "placeholder": "/media/115/转存:u115:/115/转存"}},
+            {
+                "component": "VRow",
+                "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextarea", "props": {"model": "exclude_dirs", "label": "排除目录", "rows": 2}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextarea", "props": {"model": "exclude_keywords", "label": "排除关键词", "rows": 2}}]},
+                ],
+            },
+            {"component": "VTextarea", "props": {"model": "retransfer_dirs", "label": "重新整理检测目录", "rows": 2, "placeholder": "/media/待上传"}},
+        ]
 
     # 私有属性
     _last_request_time = 0
     _request_lock = asyncio.Lock()
     _min_interval = 0.025
     # 配置
-    config: Optional[FollowUpConfig] = None
+    config: Optional[SubscriptionManagerConfig] = None
 
     def init_plugin(self, config: dict = None):
 
         # 停止现有任务
         self.stop_service()
-        self.load_config(config)
-
+        merged_config = self._merge_legacy_config(config)
+        self.load_config(merged_config)
+        self._migrate_legacy_data()
+        self._init_transfer_cleanup(self._get_config().model_dump())
         self.tmdbapi = TmdbApi()
+        self._sync_transfer_config()
+        if merged_config != (config or {}):
+            self.update_config(self._get_config().model_dump())
+
 
         if self.config.onlyonce:
             self.schedule_once()
@@ -159,19 +1447,19 @@ class FollowUp(_PluginBase):
 
     def load_config(self, config: dict):
         """加载配置"""
-        self.config = FollowUpConfig(**config) if config else FollowUpConfig()
+        self.config = SubscriptionManagerConfig(**config) if config else SubscriptionManagerConfig()
 
-    def _get_config(self) -> FollowUpConfig:
+    def _get_config(self) -> SubscriptionManagerConfig:
         """Return a usable config even when a page or event is queried early."""
-        if not isinstance(self.config, FollowUpConfig):
-            self.config = FollowUpConfig()
+        if not isinstance(self.config, SubscriptionManagerConfig):
+            self.config = SubscriptionManagerConfig()
         return self.config
 
     def schedule_once(self):
-        logger.info("续作跟进，立即运行一次")
+        logger.info("订阅管理，立即运行一次")
         loop = getattr(global_vars, "loop", None)
         if loop is None or not loop.is_running():
-            logger.warning("续作跟进无法立即运行：MoviePilot 主事件循环未运行")
+            logger.warning("订阅管理无法立即运行：MoviePilot 主事件循环未运行")
             return None
         return asyncio.run_coroutine_threadsafe(self.follow_up(), loop)
 
@@ -212,7 +1500,7 @@ class FollowUp(_PluginBase):
                 "Referer": "https://app.trakt.tv/",
                 "User-Agent": (
                     settings.USER_AGENT
-                    or f"MoviePilot-FollowUp/{self.plugin_version}"
+                    or f"MoviePilot-SubscriptionManager/{self.plugin_version}"
                 ),
             },
             cookies=cookie,
@@ -305,7 +1593,7 @@ class FollowUp(_PluginBase):
                 "trakt-api-version": "2",
                 "User-Agent": (
                     settings.USER_AGENT
-                    or f"MoviePilot-FollowUp/{self.plugin_version}"
+                    or f"MoviePilot-SubscriptionManager/{self.plugin_version}"
                 ),
             },
             cookies=cookie,
@@ -593,7 +1881,7 @@ class FollowUp(_PluginBase):
             },
         )
 
-    def get_form(self):
+    def _get_followup_form(self):
         # 获取所有启用的媒体服务器及其库信息
         mediaservers = ServiceConfigHelper.get_mediaserver_configs() or []
         libraryitems = []
@@ -814,32 +2102,53 @@ class FollowUp(_PluginBase):
             "trakt_calendar_days": 7,
         }
 
+    def get_form(self):
+        forms, defaults = self._get_followup_form()
+        if forms and isinstance(forms[0], dict):
+            forms[0].setdefault("content", []).extend(self._transfer_form_sections())
+        defaults.update({
+            "notify": True,
+            "dry_run": True,
+            "delay_enabled": False,
+            "delay_seconds": 10,
+            "monitor_dirs": "",
+            "path_mappings": "",
+            "exclude_dirs": "",
+            "exclude_keywords": "",
+            "clean_dirs": "",
+            "run_once": False,
+            "retransfer_once": False,
+            "retransfer_dirs": "",
+            "retransfer_cron": "",
+            "clean_failed": False,
+        })
+        return forms, defaults
+
     def get_service(self) -> List[Dict[str, Any]]:
-        """
-        注册插件公共服务
-        """
+        """注册续作订阅和转移记录清理两个公共服务。"""
+        services = []
         config = self._get_config()
         if config.enabled:
             try:
                 trigger = CronTrigger.from_crontab(config.cron) if config.cron else "interval"
             except (TypeError, ValueError) as exc:
-                logger.error(f"续作跟进 cron 配置无效，服务未注册：{exc}")
-                return []
-            kwargs = {"hours": 24} if not config.cron else {}
-            return [
-                {
-                    "id": "FollowUp",
-                    "name": "续作跟进",
+                logger.error(f"订阅管理 cron 配置无效，续作服务未注册：{exc}")
+            else:
+                services.append({
+                    "id": "SubscriptionManagerFollowUp",
+                    "name": "续作自动订阅",
                     "trigger": trigger,
                     "func": self.follow_up,
-                    "kwargs": kwargs,
-                }
-            ]
-        return []
+                    "kwargs": {"hours": 24} if not config.cron else {},
+                })
+        transfer_service = self._get_transfer_service()
+        if transfer_service:
+            services.extend(transfer_service)
+        return services
 
     def stop_service(self):
-        """退出插件"""
-        pass
+        """停止续作任务和转移记录清理监控。"""
+        self._stop_transfer_cleanup()
 
     def get_api(self) -> List[Dict[str, Any]]:
         return []
@@ -849,7 +2158,7 @@ class FollowUp(_PluginBase):
             {
                 "cmd": "/follow_up",
                 "event": EventType.PluginAction,
-                "desc": "续作跟进",
+                "desc": "订阅管理",
                 "category": "",
                 "data": {"action": "follow_up"}
             }
@@ -877,10 +2186,10 @@ class FollowUp(_PluginBase):
             active_records = [
                 item
                 for item in (SubscribeOper().list() or [])
-                if getattr(item, "username", None) == self.plugin_name
+                if getattr(item, "username", None) in self.subscription_owner_names
             ]
         except Exception as exc:
-            logger.warning(f"读取续作跟进当前订阅失败：{exc}")
+            logger.warning(f"读取订阅管理当前订阅失败：{exc}")
             active_records = []
 
         pending_records = []
@@ -888,7 +2197,7 @@ class FollowUp(_PluginBase):
         try:
             data_entries = self.get_data() or []
         except Exception as exc:
-            logger.warning(f"读取续作跟进待处理数据失败：{exc}")
+            logger.warning(f"读取订阅管理待处理数据失败：{exc}")
             data_entries = []
         for entry in data_entries:
             entry_key = getattr(entry, "key", None)
@@ -1186,6 +2495,13 @@ class FollowUp(_PluginBase):
         library_label = f"{len(config.libraries)} 个媒体库" if config.libraries else "全部媒体库"
         issue_hint = "无未完成 Trakt 事件" if issue_total == 0 else "需要关注的 Trakt 事件"
         issue_color = "success" if issue_total == 0 else "warning"
+        transfer_dirs = [d.strip() for d in (self._monitor_dirs or "").split("\n") if d.strip()]
+        transfer_status = (
+            f"已开启 · {len(transfer_dirs)} 个监控目录"
+            if self._enabled
+            else "已停用"
+        )
+        transfer_mode = "模拟运行" if self._dry_run else "实际清理"
 
         alerts = []
         if event_counts["failed"]:
@@ -1227,7 +2543,7 @@ class FollowUp(_PluginBase):
                             {
                                 "component": "span",
                                 "props": {"class": "text-h6 font-weight-bold"},
-                                "text": "续作跟进记录",
+                                "text": "订阅管理记录",
                             },
                             {
                                 "component": "VChip",
@@ -1252,7 +2568,7 @@ class FollowUp(_PluginBase):
                     {
                         "component": "VCardSubtitle",
                         "props": {"class": "pt-1"},
-                        "text": "自动订阅历史、当前订阅和待处理提醒 · 只读运行概览",
+                        "text": "续作订阅、Trakt 提醒和转移清理 · 只读运行概览",
                     },
                     {
                         "component": "VCardText",
@@ -1264,7 +2580,7 @@ class FollowUp(_PluginBase):
                                     metric_card(
                                         "当前订阅",
                                         str(len(active_records)),
-                                        "仍由续作跟进维护",
+                                        "仍由订阅管理维护",
                                         "primary",
                                     ),
                                     metric_card(
@@ -1321,6 +2637,8 @@ class FollowUp(_PluginBase):
                                         f"{config.trakt_calendar_days} 天",
                                     ),
                                     summary_item("扫描范围", library_label),
+                                    summary_item("转移记录清理", transfer_status),
+                                    summary_item("清理模式", transfer_mode),
                                 ],
                             },
                             *alerts,
@@ -1340,7 +2658,7 @@ class FollowUp(_PluginBase):
                                 "最近自动订阅",
                                 ["媒体", "季", "状态", "时间"],
                                 [history_row(item) for item in history_records[:preview_limit]],
-                                "暂无“续作跟进”自动订阅记录",
+                                "暂无自动订阅记录",
                                 f"预览最近 {preview_limit} 条 · 共 {len(history_records)} 条",
                                 total=len(history_records),
                             )
@@ -1379,18 +2697,18 @@ class FollowUp(_PluginBase):
         userid = event_data.get("user") or event_data.get("userid")
         self.post_message(
             channel=event_data.get("channel"),
-            title="【续作跟进】开始执行 ...",
+            title="【订阅管理】开始执行 ...",
             userid=userid,
         )
 
         try:
             future = self.schedule_once()
         except Exception as exc:
-            logger.error(f"提交续作跟进任务出错: {exc}", exc_info=True)
+            logger.error(f"提交订阅管理任务出错: {exc}", exc_info=True)
             self.post_message(
                 channel=event_data.get("channel"),
                 userid=userid,
-                title="【续作跟进】执行失败",
+                title="【订阅管理】执行失败",
                 text=f"错误信息: {exc}",
             )
             return
@@ -1399,7 +2717,7 @@ class FollowUp(_PluginBase):
             self.post_message(
                 channel=event_data.get("channel"),
                 userid=userid,
-                title="【续作跟进】执行失败",
+                title="【订阅管理】执行失败",
                 text="MoviePilot 主事件循环未运行",
             )
             return
@@ -1416,13 +2734,13 @@ class FollowUp(_PluginBase):
         try:
             future.result()
         except Exception as exc:
-            logger.error(f"执行续作跟进任务出错: {exc}", exc_info=True)
+            logger.error(f"执行订阅管理任务出错: {exc}", exc_info=True)
             result_msg = {
-                "title": "【续作跟进】执行失败",
+                "title": "【订阅管理】执行失败",
                 "text": f"错误信息: {exc}",
             }
         else:
-            result_msg = {"title": "【续作跟进】执行完成"}
+            result_msg = {"title": "【订阅管理】执行完成"}
 
         try:
             self.post_message(
@@ -1431,7 +2749,7 @@ class FollowUp(_PluginBase):
                 **result_msg,
             )
         except Exception as exc:
-            logger.error(f"发送续作跟进结果通知失败: {exc}", exc_info=True)
+            logger.error(f"发送订阅管理结果通知失败: {exc}", exc_info=True)
 
     async def _fetch_tmdb_info(self, mtype: str, tmdbid: int) -> Optional[dict]:
         # 频率限制
@@ -1552,7 +2870,7 @@ class FollowUp(_PluginBase):
             self.collection_follow_up(collections, _ignore)
 
         self.save_collections(collections)
-        logger.info("续作跟进执行完成。")
+        logger.info("订阅管理执行完成。")
 
     async def _filter_media(
         self,
@@ -2451,13 +3769,13 @@ class FollowUp(_PluginBase):
         try:
             return (
                 db.query(SubscribeHistory)
-                .filter(SubscribeHistory.username == self.plugin_name)
+                .filter(SubscribeHistory.username.in_(self.subscription_owner_names))
                 .order_by(SubscribeHistory.date.desc(), SubscribeHistory.id.desc())
                 .limit(safe_limit)
                 .all()
             )
         except Exception as exc:
-            logger.warning(f"读取续作跟进订阅历史失败：{exc}")
+            logger.warning(f"读取订阅管理订阅历史失败：{exc}")
             return []
 
     @staticmethod
