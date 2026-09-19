@@ -1315,7 +1315,7 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/i-kirito/MoviePilot-SubscriptionManager/main/icons/subscriptionmanager.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "i-kirito"
     # 作者主页
@@ -2182,6 +2182,11 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
             "clean_failed": False,
         })
         return forms, defaults
+
+    @staticmethod
+    def get_render_mode() -> tuple[str, str]:
+        """使用独立 Vue 配置页，保持与新版插件一致的分组导航和运行概览。"""
+        return "vue", "frontend/dist/assets"
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册续作订阅和转移记录清理两个公共服务。"""

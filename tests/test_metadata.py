@@ -51,6 +51,13 @@ class SubscriptionManagerMetadataTests(unittest.TestCase):
         self.assertIn('"variant": "outlined"', source)
         self.assertIn('"component": "VCardSubtitle"', source)
 
+    def test_vue_config_bundle_is_published(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        self.assertIn('return "vue", "frontend/dist/assets"', source)
+        remote_entry = ROOT / "frontend" / "dist" / "assets" / "remoteEntry.js"
+        self.assertTrue(remote_entry.is_file())
+        self.assertIn("SubscriptionManager", remote_entry.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
