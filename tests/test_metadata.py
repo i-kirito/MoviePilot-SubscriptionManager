@@ -44,6 +44,13 @@ class SubscriptionManagerMetadataTests(unittest.TestCase):
         for label in ("运行概况", "最近自动订阅", "待处理提醒", "转移记录清理", "metric_card"):
             self.assertIn(label, page_source)
 
+    def test_form_contains_grouped_configuration_sections(self):
+        source = PLUGIN.read_text(encoding="utf-8")
+        for label in ("核心开关", "Trakt 日历", "订阅扫描", "转移记录清理"):
+            self.assertIn(label, source)
+        self.assertIn('"variant": "outlined"', source)
+        self.assertIn('"component": "VCardSubtitle"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

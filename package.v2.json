@@ -3,11 +3,12 @@
     "name": "订阅管理",
     "description": "统一管理续作订阅、Trakt 日历提醒和转移记录清理",
     "labels": "订阅, 自动化, 转移清理",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/i-kirito/MoviePilot-SubscriptionManager/main/icons/subscriptionmanager.png",
     "author": "i-kirito",
     "level": 2,
     "history": {
+      "1.0.1": "i-kirito：重做配置页分区卡片和响应式布局。",
       "1.0.0": "i-kirito 合并版：统一续作订阅、Trakt 日历提醒和转移记录清理，并迁移旧插件配置与数据。"
     }
   }

@@ -1313,9 +1313,9 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
     # 插件描述
     plugin_desc = "统一管理续作订阅、Trakt 日历提醒和转移记录清理"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/i-kirito/MoviePilot-SubscriptionManager/main/icons/followup.png"
+    plugin_icon = "https://raw.githubusercontent.com/i-kirito/MoviePilot-SubscriptionManager/main/icons/subscriptionmanager.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "i-kirito"
     # 作者主页
@@ -1374,48 +1374,79 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
                 setattr(config, key, getattr(self, f"_{key}"))
 
     def _transfer_form_sections(self) -> list[dict]:
+        def field(component: str, model: str, label: str, **props: Any) -> dict:
+            field_props = {
+                "model": model,
+                "label": label,
+                "density": "comfortable",
+            }
+            field_props.update(props)
+            return {"component": component, "props": field_props}
+
+        def col(content: dict, cols: int = 12, sm: int | None = None, md: int | None = None) -> dict:
+            props: dict[str, Any] = {"cols": cols}
+            if sm is not None:
+                props["sm"] = sm
+            if md is not None:
+                props["md"] = md
+            return {"component": "VCol", "props": props, "content": [content]}
+
+        def section(title: str, subtitle: str, content: list[dict]) -> dict:
+            return {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {"class": "text-subtitle-1 font-weight-bold pt-3 pb-1"},
+                        "text": title,
+                    },
+                    {
+                        "component": "VCardSubtitle",
+                        "props": {"class": "text-caption pt-0 pb-2"},
+                        "text": subtitle,
+                    },
+                    {"component": "VCardText", "props": {"class": "pt-1"}, "content": content},
+                ],
+            }
+
         return [
-            {
-                "component": "VDivider",
-                "props": {"class": "my-2"},
-            },
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "density": "compact",
-                    "title": "转移记录清理",
-                    "text": "与续作订阅共用一个插件开关；监控目录中的文件移动/删除后，自动清理对应的转移历史。保留模拟运行和目标存在性校验。",
-                },
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送清理通知"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "dry_run", "label": "模拟运行"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VSwitch", "props": {"model": "delay_enabled", "label": "延迟删除"}}]},
-                    {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{"component": "VTextField", "props": {"model": "delay_seconds", "label": "延迟秒数", "type": "number", "min": 1, "max": 3600}}]},
+            section(
+                "转移记录清理",
+                "监控目录中的文件移动或删除后，自动清理对应的转移历史。与续作订阅共用插件开关。",
+                [
+                    {
+                        "component": "VRow",
+                        "props": {"class": "ga-1"},
+                        "content": [
+                            col(field("VSwitch", "notify", "发送清理通知"), 12, 6, 3),
+                            col(field("VSwitch", "dry_run", "模拟运行"), 12, 6, 3),
+                            col(field("VSwitch", "delay_enabled", "延迟删除"), 12, 6, 3),
+                            col(field("VTextField", "delay_seconds", "延迟秒数", type="number", min=1, max=3600), 12, 6, 3),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"class": "ga-1"},
+                        "content": [
+                            col(field("VSwitch", "run_once", "立即清理一次"), 12, 6, 4),
+                            col(field("VSwitch", "clean_failed", "清理假失败记录"), 12, 6, 4),
+                            col(field("VTextField", "retransfer_cron", "清理定时周期", placeholder="0 */2 * * *"), 12, 12, 4),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"class": "ga-1"},
+                        "content": [
+                            col(field("VTextarea", "monitor_dirs", "监控目录（每行一个）", rows=2, placeholder="/media/待上传\n/media/downloads"), 12, 12, 6),
+                            col(field("VTextarea", "path_mappings", "路径映射（每行一个）", rows=2, placeholder="/media/115/转存:u115:/115/转存"), 12, 12, 6),
+                            col(field("VTextarea", "exclude_dirs", "排除目录", rows=2), 12, 12, 6),
+                            col(field("VTextarea", "exclude_keywords", "排除关键词", rows=2), 12, 12, 6),
+                            col(field("VTextarea", "retransfer_dirs", "重新整理检测目录", rows=2, placeholder="/media/待上传"), 12, 12, 6),
+                        ],
+                    },
                 ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "run_once", "label": "立即清理一次"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "clean_failed", "label": "清理假失败记录"}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "retransfer_cron", "label": "清理定时周期", "placeholder": "0 */2 * * *"}}]},
-                ],
-            },
-            {"component": "VTextarea", "props": {"model": "monitor_dirs", "label": "监控目录（每行一个）", "rows": 2, "placeholder": "/media/待上传\n/media/downloads"}},
-            {"component": "VTextarea", "props": {"model": "path_mappings", "label": "路径映射（每行一个）", "rows": 2, "placeholder": "/media/115/转存:u115:/115/转存"}},
-            {
-                "component": "VRow",
-                "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextarea", "props": {"model": "exclude_dirs", "label": "排除目录", "rows": 2}}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextarea", "props": {"model": "exclude_keywords", "label": "排除关键词", "rows": 2}}]},
-                ],
-            },
-            {"component": "VTextarea", "props": {"model": "retransfer_dirs", "label": "重新整理检测目录", "rows": 2, "placeholder": "/media/待上传"}},
+            ),
         ]
 
     # 私有属性
@@ -1909,7 +1940,7 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
                     }
                 )
 
-        return [
+        form = [
             {
                 'component': 'VForm',
                 'content': [
@@ -2089,7 +2120,8 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
                     },
                 ],
             },
-        ], {
+        ]
+        defaults = {
             "enabled": False,
             "auto_subscribe": True,
             "after_days": 2,
@@ -2101,6 +2133,33 @@ class SubscriptionManager(TransferCleanupMixin, _PluginBase):
             "trakt_calendar_enabled": False,
             "trakt_calendar_days": 7,
         }
+
+        def section(title: str, subtitle: str, content: list[dict]) -> dict:
+            return {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {"class": "text-subtitle-1 font-weight-bold pt-3 pb-1"},
+                        "text": title,
+                    },
+                    {
+                        "component": "VCardSubtitle",
+                        "props": {"class": "text-caption pt-0 pb-2"},
+                        "text": subtitle,
+                    },
+                    {"component": "VCardText", "props": {"class": "pt-1"}, "content": content},
+                ],
+            }
+
+        core, trakt, scan, libraries = form[0]["content"]
+        form[0]["content"] = [
+            section("核心开关", "控制插件启停、执行周期和命中订阅后的处理方式。", [core]),
+            section("Trakt 日历", "从 MoviePilot 全局 CookieCloud 读取个人剧集日历，仅匹配明确的 TMDB ID。", [trakt]),
+            section("订阅扫描", "控制订阅历史检查范围与提醒窗口。", [scan, libraries]),
+        ]
+        return form, defaults
 
     def get_form(self):
         forms, defaults = self._get_followup_form()
